@@ -1,14 +1,15 @@
 """Main orchestration entrypoint: query file(s) -> CSV submission(s).
 
-This is currently a skeleton wiring together the parts that ARE built
-(query parsing, CSV writing, config) with clearly marked TODOs for the
-retrieval/model logic from the build-order in the README. Fill in
-`run_kis`, `run_qa`, `run_trake` as those pieces come online -- the I/O
-contract (Query in, csv_writer.*Candidate out) is already fixed so you
-can build/test each task's retrieval logic independently.
+Loading strategy:
+  - Index resources (FAISS + sidecar + BM25) load once, lazily, on the
+    first query that needs them.
+  - The CLIP text encoder loads on first query.
+  - The VLM (Qwen2-VL, ~16 GB VRAM at fp16) loads ONLY when the first
+    Q&A query arrives, so KIS/TRAKE-only runs never pay for it.
 
-Usage (once retrieval is implemented):
+Usage:
     python -m aic_system.pipeline --config default --queries data/queries --out data/submission
+    python -m aic_system.pipeline --alpha 0.8 --top-k-vqa 30 --vlm-model Qwen/Qwen2-VL-2B-Instruct
 """
 from __future__ import annotations
 
@@ -18,54 +19,106 @@ from pathlib import Path
 from aic_system.config import load_config, resolve_path
 from aic_system.io.csv_writer import write_submission
 from aic_system.io.query_parser import Query, load_query_dir
+from aic_system.retrieval.search import run_kis, run_qa, run_trake
 
 
-def run_kis(query: Query, cfg: dict) -> list:
-    # TODO: embed query.text, search the FAISS visual/text index, group
-    # hits into (video, frame) candidates, sort best-first, return
-    # list[csv_writer.KISCandidate] of length <= 100.
-    raise NotImplementedError("KIS retrieval not implemented yet")
+class Resources:
+    """Lazily-initialized shared state for all task runners."""
+
+    def __init__(self, cfg: dict, args):
+        self.cfg = cfg
+        self.args = args
+        self._index: dict | None = None
+        self._clip = None
+        self._vlm = None
+
+    @property
+    def index(self) -> dict:
+        if self._index is None:
+            from aic_system.ingest.indexer import load_index_resources
+
+            self._index = load_index_resources(self.cfg)
+            # Let CLI args override the config's retrieval hyperparameters.
+            if self.args.alpha is not None:
+                self.cfg["retrieval"]["alpha"] = self.args.alpha
+            if self.args.top_k_vqa is not None:
+                self.cfg["retrieval"]["top_k_for_vqa"] = self.args.top_k_vqa
+            if self.args.vlm_model:
+                self.cfg["models"]["vqa"]["name"] = self.args.vlm_model
+        return self._index
+
+    @property
+    def clip(self):
+        if self._clip is None:
+            from aic_system.models.clip_encoder import CLIPTextEncoder
+
+            m = self.cfg["models"]["clip_text"]
+            print(f"  [clip] loading {m['name']} on {m.get('device', 'cuda')} ...")
+            self._clip = CLIPTextEncoder(model_name=m["name"], device=m.get("device", "cuda"))
+        return self._clip
+
+    @property
+    def vlm(self):
+        if self._vlm is None:
+            from aic_system.models.vlm import VLM
+
+            m = self.cfg["models"]["vqa"]
+            print(f"  [vlm] loading {m['name']} ({m.get('dtype', 'float16')}) ...")
+            self._vlm = VLM(
+                model_name=m["name"],
+                fallback_name=m.get("fallback_name"),
+                device=m.get("device", "cuda"),
+                dtype=m.get("dtype", "float16"),
+                max_new_tokens=m.get("max_new_tokens", 32),
+            )
+        return self._vlm
 
 
-def run_qa(query: Query, cfg: dict) -> list:
-    # TODO: reuse run_kis's retrieval for top-K frame candidates, run the
-    # VQA model per candidate, re-rank, return list[csv_writer.QACandidate].
-    raise NotImplementedError("Q&A retrieval not implemented yet")
+def _alpha(resources: Resources) -> float:
+    return resources.cfg["retrieval"].get("alpha", 0.7)
 
 
-def run_trake(query: Query, cfg: dict) -> list:
-    # TODO: split query.text into events, retrieve per event, lock to a
-    # single video, order chronologically, return list[csv_writer.TrakeCandidate].
-    raise NotImplementedError("TRAKE retrieval not implemented yet")
-
-
-_TASK_RUNNERS = {"kis": run_kis, "qa": run_qa, "trake": run_trake}
-
-
-def process_query_file(stem: str, queries: list[Query], cfg: dict, out_dir: Path) -> None:
+def process_query_file(stem: str, queries: list[Query], resources: Resources, out_dir: Path) -> None:
     if not queries:
         return
     task = queries[0].task
-    runner = _TASK_RUNNERS[task]
 
     all_candidates = []
     for q in queries:
         try:
-            all_candidates.extend(runner(q, cfg))
-        except NotImplementedError as e:
-            print(f"  [{q.query_id}] skipped: {e}")
-            return
+            if task == "kis":
+                all_candidates.extend(run_kis(q, resources.index, resources.clip, alpha=_alpha(resources)))
+            elif task == "qa":
+                all_candidates.extend(
+                    run_qa(q, resources.index, resources.clip, resources.vlm, alpha=_alpha(resources))
+                )
+            elif task == "trake":
+                all_candidates.extend(run_trake(q, resources.index, resources.clip, alpha=_alpha(resources)))
+            else:
+                raise ValueError(f"unknown task {task!r}")
+        except Exception as e:  # one bad query must not kill the package
+            print(f"  [{q.query_id}] FAILED: {type(e).__name__}: {e}")
+            continue
 
+    if not all_candidates:
+        print(f"  [{stem}] no candidates produced; CSV not written")
+        return
     out_path = out_dir / f"{stem}.csv"
     write_submission(task, out_path, all_candidates, query_id=stem)
-    print(f"  wrote {out_path}")
+    print(f"  wrote {out_path} ({len(all_candidates)} rows)")
 
 
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--config", default="default")
     ap.add_argument("--queries", default=None, help="override configs paths.queries_dir")
     ap.add_argument("--out", default=None, help="override configs paths.submission_dir")
+    ap.add_argument("--alpha", type=float, default=None,
+                    help="visual (CLIP) weight in fusion; 1-alpha goes to BM25")
+    ap.add_argument("--top-k-vqa", type=int, default=None,
+                    help="how many retrieved frames the VLM answers per Q&A query")
+    ap.add_argument("--vlm-model", default=None,
+                    help="override models.vqa.name (e.g. Qwen/Qwen2-VL-2B-Instruct)")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -78,9 +131,10 @@ def main():
         print(f"No query-*.txt files found in {queries_dir}")
         return
 
+    resources = Resources(cfg, args)
     for stem, queries in query_files.items():
         print(f"Processing {stem} ({len(queries)} queries, task={queries[0].task})...")
-        process_query_file(stem, queries, cfg, out_dir)
+        process_query_file(stem, queries, resources, out_dir)
 
 
 if __name__ == "__main__":

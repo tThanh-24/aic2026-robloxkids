@@ -1,4 +1,6 @@
 .venv/
+venv/
+*.egg-info/
 __pycache__/
 *.pyc
 .pytest_cache/
@@ -10,6 +12,7 @@ data/features/
 data/metadata/
 data/index/
 data/_downloads/
+data/queries/
 data/submission/*.csv
 submission.zip
 

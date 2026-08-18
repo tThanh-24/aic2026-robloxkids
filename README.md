@@ -1,169 +1,235 @@
-# AICVideo Retrieval System (KIS / Q&A / TRAKE)
+# AIC25 Video Retrieval System (KIS / Q&A / TRAKE)
 
-A pipeline for the AIC25-style video retrieval competition: given text
-queries, return up to 100 ranked `(video, frame[, answer])` candidates per
-query as CSV, scored by Mean of Top-k R-Score (`R@1,5,20,50,100`).
+A pipeline for the AIC-style video retrieval competition. Given text queries,
+it returns up to 100 ranked `(video, frame)` candidates per query as CSV,
+packaged into `submission.zip` for Codabench.
 
-## Status
+Three task types are supported (inferred from the query filename suffix):
 
-| Piece | Status |
-|---|---|
-| CSV writer (exact competition format) | ✅ built + tested |
-| Submission validator (pre-upload gate) | ✅ built + tested |
-| Submission packager (correct zip structure) | ✅ built + tested |
-| Local scorer (reimplements R@k / Mean-of-Top-k) | ✅ built + tested, matches both spec worked examples |
-| Query file parser | ✅ built (⚠️ format assumptions -- see below) |
-| Dataset download script (aria2c) | ✅ built |
-| Dataset inspector | ✅ built, **run before trusting ingestion code** |
-| KIS / Q&A / TRAKE retrieval | ❌ not implemented -- `src/aic_system/pipeline.py` has the wiring + TODOs |
-| Embedding index build (map-keyframes + clip-features -> FAISS) | ❌ not implemented |
-| OCR / ASR / objects ingestion | ❌ not implemented |
+| Task | What it does | Output CSV columns |
+|------|--------------|--------------------|
+| **KIS** | Known-item search: CLIP text→image retrieval fused with BM25 over media-info text | `video,frame` |
+| **QA** | KIS retrieval, then Qwen2-VL reads the top frames and answers the question | `video,frame,answer` (answer ≤ 100 chars) |
+| **TRAKE** | Temporal ranking of key events: per-event retrieval + video voting | `video,frame1,frame2,...` (non-decreasing) |
 
-## Quickstart
+The pipeline runs entirely on the **organizer's pre-extracted packages**
+(CLIP features, map-keyframes, media-info, keyframe JPEGs). Raw videos are
+never needed — don't download them unless you want them for debugging.
+
+```
+dataset packages ──▶ indexer (FAISS + BM25, one-time ~2 min)
+                            │
+queries (*.txt) ──▶ pipeline ──▶ data/submission/*.csv
+                            │         │
+                            │         └─▶ validate_submission.py ─▶ package_submission.py ─▶ submission.zip
+                            └─▶ Q&A only: Qwen2-VL answers from keyframe JPEGs
+```
+
+## Requirements
+
+- **OS**: Linux (developed on Ubuntu, Python 3.10; 3.11 also works)
+- **GPU**: NVIDIA with driver ≥ 550 for the cu124 wheels (verified on an
+  RTX 3090 / 24 GB). Qwen2-VL-7B at fp16 needs ~16–17 GB VRAM; it falls
+  back to the 2B model automatically on OOM. CLIP falls back to CPU if no
+  GPU is present. KIS/TRAKE-only runs never load the VLM at all.
+- **Disk**: a few GB for keyframes/features/metadata + ~17 GB cached Hugging
+  Face weights (CLIP + Qwen2-VL) + ~350 MB for the built index
+- **System packages**: `aria2`, `unzip` (dataset download)
+
+## Setup
+
+Install order matters: **torch first** from the PyTorch index (so the CUDA
+build is cu124, not the default PyPI one), then everything else resolved
+against it.
 
 ```bash
-# 1. Set up the venv (torch installed first, pinned to your CUDA build)
-./scripts/setup_venv.sh          # cuda (default, RTX 3090)
-# ./scripts/setup_venv.sh cpu    # cpu-only, for dev without a GPU
+git clone <repo-url> && cd aic2026-robloxkids
 
-source .venv/bin/activate
+# 1. venv (run.sh finds either ./venv or ./.venv)
+python3 -m venv venv
+source venv/bin/activate
 
-# 2. Download the dataset (edit scripts/download_links.txt to change what's fetched)
-sudo apt install aria2 unzip     # if not already installed
-./scripts/download_dataset.sh --list-only        # see the plan first
-./scripts/download_dataset.sh --only keyframes,map,clip   # smallest useful subset
-./scripts/download_dataset.sh                     # everything
+# 2. torch FIRST, pinned cu124 build
+pip install --upgrade pip wheel setuptools
+pip install torch==2.6.0 torchaudio==2.6.0 torchvision==0.21.0 \
+  --index-url https://download.pytorch.org/whl/cu124
 
-# 3. VERIFY real schemas before writing/trusting ingestion code
-python scripts/inspect_dataset.py
+# 3. everything else + the package itself (editable, with dev tools)
+pip install -r requirements.txt
+pip install -e ".[dev]"
 
-# 4. Run tests
-pytest tests/
+# 4. dataset download tools
+sudo apt install aria2 unzip
 
-# 5. (once retrieval is implemented) run the pipeline
+# sanity check
+python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+```
+
+> **Note on `scripts/setup_venv.sh`**: it predates `requirements.txt` — it
+> pins the older torch 2.5.1/cu121 and, because `requirements.lock.txt`
+> currently ships as a comments-only placeholder, its lockfile branch would
+> install nothing beyond torch. Prefer the manual steps above until the
+> script is refreshed (see "Lockfile" under Troubleshooting).
+
+## Get the data
+
+Download links live in `scripts/download_links.txt` — that's the only file
+to edit to add/remove batches (e.g. a future `L31` set).
+
+```bash
+# everything the pipeline needs (NO raw videos)
+./scripts/download_dataset.sh --only keyframes,map,clip,media_info
+
+# other useful invocations
+./scripts/download_dataset.sh --list-only     # print the plan, do nothing
+./scripts/download_dataset.sh                 # everything incl. videos (~100 GB)
+./scripts/download_dataset.sh --jobs 4 --conns 8
+```
+
+Archives are classified by filename pattern and extracted to:
+
+| Category | Filename pattern | Extracted to |
+|----------|------------------|--------------|
+| keyframes | `Keyframes_*.zip` | `data/raw/keyframes/` |
+| videos | `Videos_*.zip` | `data/raw/videos/` (not used by the pipeline) |
+| clip | `clip-features-*.zip` | `data/features/clip/` |
+| map | `map-keyframes-*.zip` | `data/metadata/map_keyframes/` |
+| media_info | `media-info-*.zip` | `data/metadata/media_info/` |
+| objects | `objects-*.zip` | `data/metadata/objects/` |
+
+After the first download, `python scripts/inspect_dataset.py` prints one
+real sample per category so you can verify schemas.
+
+## Add queries
+
+Query files go in `data/queries/` named `query-N-{kis,qa,trake}.txt`
+(the suffix determines the task). One query per non-empty line; an optional
+`qid<TAB>text` prefix is honored. Two examples ship in `data/queries/`.
+
+## Run
+
+One command does everything — venv check, (optional) download, index build
+if missing, pipeline, validation, packaging:
+
+```bash
+./scripts/run.sh --download     # first run: fetch data too
+./scripts/run.sh                # later runs (index is reused)
+./scripts/run.sh --rebuild-index --alpha 0.8 --top-k-vqa 30
+./scripts/run.sh --vlm-model Qwen/Qwen2-VL-2B-Instruct   # smaller VLM
+```
+
+Unrecognized flags pass through to the pipeline module, so `--help` there
+lists everything (`python -m aic_system.pipeline --help`).
+
+Step-by-step equivalents:
+
+```bash
+# 1. one-time index build (~2 min) -> data/index/{faiss.idx, sidecar.npz, video_names.json, bm25.pkl}
+python -m aic_system.ingest.indexer --config default
+
+# 2. queries -> CSVs in data/submission/
 python -m aic_system.pipeline --config default
 
-# 6. ALWAYS validate before uploading
+# 3. validate the CSVs against the competition format
 python scripts/validate_submission.py data/submission/
-python scripts/package_submission.py     # validates + zips correctly
+
+# 4. package submission.zip (runs validation first; refuses to zip on errors)
+python scripts/package_submission.py
 ```
 
-## Repo layout
+Upload `submission.zip` to Codabench. The zip contains a top-level
+`submission/` directory with the CSVs — this is a spec requirement, and the
+packaging/validation scripts exist so a format mistake never burns one of
+your limited submission attempts.
+
+## Configuration
+
+`configs/default.yaml` holds all defaults: dataset paths, retrieval
+hyperparameters (`alpha` = CLIP weight in fusion, `1-alpha` goes to BM25;
+`top_k_clip`, `top_k_for_vqa`, TRAKE settings), and model choices.
+
+Put machine-specific overrides in `configs/local.yaml` (gitignored) — it is
+deep-merged over the default, e.g.:
+
+```yaml
+models:
+  vqa:
+    device: "cpu"
+```
+
+## Tests
+
+```bash
+source venv/bin/activate
+pytest
+```
+
+## Docker (alternative to the venv setup)
+
+```bash
+docker build -t aic-system .
+
+docker run --gpus all --rm \
+  -v /path/to/clip-features-32:/app/data/features/clip:ro \
+  -v /path/to/map-keyframes:/app/data/metadata/map_keyframes:ro \
+  -v /path/to/media-info:/app/data/metadata/media_info:ro \
+  -v /path/to/keyframes:/app/data/raw/keyframes:ro \
+  -v $PWD/data/queries:/app/data/queries:ro \
+  -v $PWD/data/index:/app/data/index \
+  -v $PWD/data/submission:/app/data/submission \
+  -v hf-cache:/cache/huggingface \
+  aic-system
+```
+
+The entrypoint builds the index on first start (if `data/index/faiss.idx`
+is absent), then runs the pipeline. Flags go after the image name:
+`docker run --gpus all --rm [mounts...] aic-system python -m aic_system.pipeline --alpha 0.8`.
+Model weights (~17 GB) persist in the `hf-cache` volume.
+
+## Troubleshooting
+
+- **"aria2c not found" / "unzip not found"** — `sudo apt install aria2 unzip`.
+- **torch installed the wrong CUDA build** — it must come from the
+  `--index-url https://download.pytorch.org/whl/cu124` page *before*
+  `requirements.txt`; check with `python -c "import torch; print(torch.__version__)"`
+  (expect `2.6.0+cu124`).
+- **VLM OOM / no GPU** — use `--vlm-model Qwen/Qwen2-VL-2B-Instruct` or a
+  `configs/local.yaml` override; the pipeline also auto-falls-back to the
+  2B model on OOM, and KIS/TRAKE-only runs skip the VLM entirely.
+- **Q&A answers empty** — the VLM needs the keyframe JPEGs
+  (`paths.raw_keyframes`); without them Q&A retrieval still works but
+  answering is disabled.
+- **Lockfile** — `requirements.lock.txt` is a placeholder on purpose. To get
+  reproducible installs, generate a real one once your venv works
+  (`pip install pip-tools && pip-compile pyproject.toml -o requirements.lock.txt --extra dev`)
+  and commit it; `scripts/setup_venv.sh` will then prefer it. Until then,
+  use the manual setup steps above.
+- **faiss/numpy** — numpy is pinned `<2.0` because faiss-cpu wheels lag
+  behind numpy 2.x; don't upgrade numpy independently.
+
+## Project layout
 
 ```
+configs/default.yaml        all defaults (paths, models, retrieval params)
 scripts/
-  download_links.txt        <- EDIT THIS to add/remove/change dataset URLs
-  download_dataset.sh        aria2c-based fetch + extract, driven by the list above
-  inspect_dataset.py          peeks at real files to confirm schemas
-  setup_venv.sh                creates .venv, installs torch first then the rest
-  validate_submission.py      pre-upload format gate -- run this every time
-  package_submission.py       zips data/submission/*.csv -> submission.zip correctly
-
+  download_links.txt        dataset URLs — the only file to edit for new batches
+  download_dataset.sh       aria2c download + extract, category-aware
+  run.sh                    one command: download? -> index -> pipeline -> validate -> zip
+  setup_venv.sh             venv bootstrap (older torch pin — see note above)
+  inspect_dataset.py        print real samples/schemas after first download
+  validate_submission.py    competition-format checks (run before every upload)
+  package_submission.py     zip CSVs under submission/ for Codabench
 src/aic_system/
-  config.py                  loads configs/default.yaml (+ configs/local.yaml overrides)
-  pipeline.py                 entrypoint: query files -> CSVs (retrieval logic is TODO)
-  io/
-    query_parser.py           query-N-{kis,qa,trake}.txt -> Query objects
-    csv_writer.py               Query results -> competition-format CSV
-  eval/
-    local_scorer.py             reimplements R@k / Mean-of-Top-k scoring
-  ingest/                      (empty -- see "Next steps")
-  models/                      (empty -- see "Next steps")
-  retrieval/                    (empty -- see "Next steps")
-
-tests/                         pytest suite for csv_writer + local_scorer
-configs/default.yaml            all paths, model names, competition constants
+  pipeline.py               entrypoint: query files -> CSVs (lazy model loading)
+  config.py                 default.yaml + optional local.yaml deep-merge
+  ingest/indexer.py         one-time FAISS + BM25 index build
+  retrieval/search.py       KIS / QA / TRAKE runners (fusion + VQA)
+  models/                   CLIP text encoder, Qwen2-VL wrapper
+  io/                       query parser, submission CSV writer
+  eval/local_scorer.py      local R@k scoring against a ground truth
+data/
+  queries/                  query-N-{kis,qa,trake}.txt (input)
+  index/                    built index artifacts (generated)
+  submission/               output CSVs (generated)
 ```
-
-## Dataset assets (organizer-provided)
-
-| Asset | Expected content | Confidence |
-|---|---|---|
-| `Keyframes_L2X.zip` | pre-extracted representative frames per video, `L2X_V0NN/*.jpg` | high (standard AIC convention) |
-| `Videos_L2X_a.zip` | source `.mp4` files | high |
-| `map-keyframes-aic25-b1.zip` | per-video CSV mapping keyframe index -> real frame index / timestamp | **verify with inspect_dataset.py** -- this is the join key between retrieval output and the frame IDs ground truth intervals are expressed in |
-| `clip-features-32-aic25-b1.zip` | per-video `.npy`, one row per keyframe, CLIP ViT-B/32 embeddings (dim 512) | **verify** -- column order must match map-keyframes row order |
-| `media-info-aic25-b1.zip` | per-video JSON: title/description/keywords/etc | medium |
-| `objects-aic25-b1.zip` | per-keyframe JSON: detected object classes + boxes | medium |
-
-Nothing in the pipeline should hardcode assumptions about these schemas
-without `inspect_dataset.py` having confirmed them first -- that script
-exists specifically to catch a wrong assumption before it's baked into
-hours of ingestion code.
-
-## Dependency strategy (single venv, no conflicts)
-
-The main conflict risk in this stack is multiple libraries each wanting
-their own CUDA runtime. The approach:
-
-1. **torch is installed first**, pinned to a `cu121` wheel (matches the
-   Docker base image `nvidia/cuda:12.1.1-...`, works with RTX 3090 given
-   driver >=530). Every other GPU-touching library is chosen to be
-   compatible with *this* runtime rather than bringing its own.
-2. **EasyOCR instead of PaddleOCR** -- PaddleOCR's `paddlepaddle-gpu`
-   ships its own CUDA expectations and has a history of fighting with a
-   separately-installed torch. EasyOCR is torch-based, so it shares
-   torch's CUDA runtime for free. (OCR isn't the bottleneck anyway; if you
-   want it fully off the GPU, `configs/default.yaml -> models.ocr.gpu: false`
-   runs it on CPU.)
-3. **faiss-cpu instead of faiss-gpu** -- `faiss-gpu` has its own
-   CUDA-linking quirks and, for a corpus in the hundreds-of-thousands to
-   low-millions of frames, CPU FAISS (flat or IVF index) is fast enough
-   that it's not worth the conflict risk. Revisit only if the corpus turns
-   out to be much larger than expected.
-4. **faster-whisper** uses `ctranslate2`, a self-contained C++ runtime
-   that doesn't fight with torch's CUDA build.
-5. Everything is one `pyproject.toml` -> one lockfile
-   (`requirements.lock.txt`, generate with `pip-compile` once the venv is
-   working) -> one Docker image built from that lockfile, so dev and
-   container environments can't drift.
-
-## Submission safety net
-
-You get **3 submission attempts per query package, and a malformed file
-still burns an attempt.** Every path from CSV generation to Codabench
-upload goes through:
-
 ```
-write_submission()  ->  validate_submission.py  ->  package_submission.py  ->  upload
-                              ^
-                    also run standalone anytime
-```
-
-`package_submission.py` refuses to produce a zip if validation fails
-(`--force` overrides this, not recommended). Use `local_scorer.py` against
-a self-made held-out ground-truth split (JSONL, see its docstring for the
-schema) to estimate R@k *before* spending a real attempt -- the public
-leaderboard only reflects 50% of ground truth, so don't over-index on it
-either.
-
-## Open questions / things to verify against real data
-
-- **Query `.txt` internal format** -- `query_parser.py` currently assumes
-  one query per line, optionally `qid<TAB>text`. Confirm against a real
-  downloaded query package and adjust `_parse_lines` if it differs (JSON,
-  one-query-per-file, etc.) -- everything downstream consumes `Query`
-  objects, so the blast radius of being wrong is contained to that one
-  function.
-- **Q&A answer comparison rule** -- the competition doc says answers are
-  compared "according to the competition's stated semantic/exact
-  comparison rule" without giving the rule. `local_scorer.py` currently
-  does case/whitespace-insensitive exact match as a conservative default
-  -- update `_normalize_answer` once the real rule is published.
-- **map-keyframes / clip-features exact schema** -- run
-  `inspect_dataset.py` after the first download and update
-  `configs/default.yaml -> models.provided_clip` and the (not yet written)
-  `ingest/` modules accordingly.
-
-## Next steps (build order, see earlier planning discussion)
-
-1. `ingest/build_index.py` -- parse map-keyframes + clip-features into a
-   FAISS index + metadata store (SQLite/Parquet).
-2. `retrieval/kis.py` -- embed query text, search the index, group into
-   ranked `(video, frame)` candidates.
-3. `retrieval/qa.py` -- reuse KIS retrieval, add VQA re-ranking
-   (Qwen2-VL-7B-Instruct fits comfortably in 3090 VRAM at fp16).
-4. `retrieval/trake.py` -- event decomposition, per-event retrieval,
-   single-video locking, chronological ordering.
-5. Wire all three into `pipeline.py`'s `run_kis` / `run_qa` / `run_trake`.
-6. Error-analyze against the local scorer, iterate.

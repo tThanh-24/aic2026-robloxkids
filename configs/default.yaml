@@ -24,28 +24,22 @@ competition:
 
 models:
   # Provided by organizer: clip-features-32-aic25-b1 => CLIP ViT-B/32, dim 512.
-  # Set here so downstream code doesn't hardcode it; verify against
-  # inspect_dataset.py output before trusting this.
-  provided_clip:
-    name: "ViT-B/32"
-    dim: 512
-  # Optional stronger embedder you may add on top of the provided features.
-  embedder:
-    name: "google/siglip-so400m-patch14-384"
-    device: "cuda"
+  # The TEXT encoder below must be the matching tower of the same model so
+  # that text/image embeddings live in the same space.
+  clip_text:
+    name: "openai/clip-vit-base-patch32"
+    device: "cuda"        # falls back to cpu automatically if unavailable
   vqa:
     name: "Qwen/Qwen2-VL-7B-Instruct"
+    fallback_name: "Qwen/Qwen2-VL-2B-Instruct"   # used automatically on OOM
     device: "cuda"
     dtype: "float16"
-  asr:
-    name: "large-v3"
-    device: "cuda"
-    compute_type: "float16"
-  ocr:
-    languages: ["vi", "en"]
-    gpu: false   # kept off GPU on purpose, see README "Dependency strategy"
+    max_new_tokens: 32    # answers are short (<=100 chars); never let it ramble
 
 retrieval:
-  visual_weight: 0.7
-  text_weight: 0.3
-  top_k_for_vqa: 20      # how many KIS candidates get passed into the VQA re-rank
+  alpha: 0.7              # visual (CLIP) weight; 1-alpha goes to BM25
+  top_k_clip: 200         # FAISS candidates fetched per query before fusion
+  top_k_for_vqa: 20       # KIS candidates passed to the VLM for answering
+  trake:
+    per_event_clip_k: 50  # keyframe candidates per event for video voting
+    per_event_frames: 3   # frames per event used to build candidate rows
