@@ -20,6 +20,10 @@ Scoring-driven design choices (see doc.md):
     the interval carries a semantically-correct answer.
   - TRAKE rows must have EXACTLY N frames in chronological order; a row
     with the wrong count risks failing the evaluator's parser entirely.
+  - Every task accepts an optional `vlm`; when given, KIS/TRAKE rerank
+    their shortlists with visual verification (yes/no relevance) and
+    TRAKE may also split implicit multi-event queries with it. With
+    vlm=None all three runners are pure CLIP+BM25.
 """
 from __future__ import annotations
 
@@ -119,18 +123,7 @@ def _retrieve(query_text: str, resources: dict, encoder: CLIPTextEncoder,
 
 
 # ---------------------------------------------------------------------------
-# KIS
-# ---------------------------------------------------------------------------
-def run_kis(query: Query, resources: dict, encoder: CLIPTextEncoder,
-            alpha: float = 0.7) -> list[KISCandidate]:
-    cfg = resources["cfg"]["retrieval"]
-    ranked = _retrieve(query.text, resources, encoder, alpha,
-                       top_k_clip=cfg.get("top_k_clip", 200), top_k=100)
-    return [KISCandidate(video=h["video"], frame=h["frame_idx"]) for h in ranked]
-
-
-# ---------------------------------------------------------------------------
-# Q&A
+# Shared VLM-stage helpers (used by KIS rerank, Q&A answering, TRAKE verify)
 # ---------------------------------------------------------------------------
 def _keyframe_image(resources: dict, video: str, keyframe_n: int) -> Path | None:
     """Locate {raw_keyframes}/{video}/{nnn}.jpg, tolerating naming variants
@@ -145,10 +138,51 @@ def _keyframe_image(resources: dict, video: str, keyframe_n: int) -> Path | None
     return None
 
 
-def run_qa(query: Query, resources: dict, encoder: CLIPTextEncoder, vlm,
-           alpha: float = 0.7, top_k_vqa: int = 20) -> list[QACandidate]:
+def _blend_ranked(hits: list[dict], conf_key: str) -> list[dict]:
+    """Rank by 0.5 * normalized retrieval score + 0.5 * VLM score.
+
+    The ranking rule run_qa has always used, factored out so the KIS rerank
+    applies the same combination. Hits without the VLM key (e.g. an image
+    that could not be located -> neutral 0.5) keep their retrieval order.
+    """
+    max_fused = max((h["fused"] for h in hits), default=0.0) or 1.0
+    return sorted(
+        hits,
+        key=lambda h: 0.5 * (h["fused"] / max_fused) + 0.5 * h.get(conf_key, 0.5),
+        reverse=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# KIS
+# ---------------------------------------------------------------------------
+def run_kis(query: Query, resources: dict, encoder: CLIPTextEncoder,
+            alpha: float = 0.7, vlm=None) -> list[KISCandidate]:
     cfg = resources["cfg"]["retrieval"]
-    top_k_vqa = top_k_vqa or cfg.get("top_k_for_vqa", 20)
+    ranked = _retrieve(query.text, resources, encoder, alpha,
+                       top_k_clip=cfg.get("top_k_clip", 200), top_k=100)
+
+    # VLM rerank: visually verify the head of the list; the remaining rows
+    # stay in retrieval order (deeper rows are free attempts under
+    # max-R@k scoring, so verification effort is spent only up front).
+    if vlm is not None and ranked:
+        rerank_n = min(int(cfg.get("rerank", {}).get("kis_top_k", 40)), len(ranked))
+        for hit in ranked[:rerank_n]:
+            image = _keyframe_image(resources, hit["video"], hit["keyframe_n"])
+            hit["vlm"] = vlm.verify(image, query.text) if image else 0.5
+        ranked = _blend_ranked(ranked[:rerank_n], "vlm") + ranked[rerank_n:]
+
+    return [KISCandidate(video=h["video"], frame=h["frame_idx"]) for h in ranked]
+
+
+# ---------------------------------------------------------------------------
+# Q&A
+# ---------------------------------------------------------------------------
+def run_qa(query: Query, resources: dict, encoder: CLIPTextEncoder, vlm,
+           alpha: float = 0.7, top_k_vqa: int | None = None) -> list[QACandidate]:
+    cfg = resources["cfg"]["retrieval"]
+    if top_k_vqa is None:
+        top_k_vqa = int(cfg.get("top_k_for_vqa", 20))
     lang = detect_language(query.text)
 
     ranked = _retrieve(query.text, resources, encoder, alpha,
@@ -169,10 +203,7 @@ def run_qa(query: Query, resources: dict, encoder: CLIPTextEncoder, vlm,
 
     # Rank answered candidates by retrieval score + VLM confidence, then
     # keep extending the list with the remaining retrieval filler rows.
-    max_fused = max(h["fused"] for h in answered) or 1.0
-    answered.sort(
-        key=lambda h: 0.5 * (h["fused"] / max_fused) + 0.5 * h["conf"], reverse=True
-    )
+    answered = _blend_ranked(answered, "conf")
     primary_answer = answered[0]["answer"]
 
     candidates = [QACandidate(video=h["video"], frame=h["frame_idx"], answer=h["answer"])
@@ -222,16 +253,34 @@ def _video_vote(event_hits: list[list[dict]]) -> list[str]:
 
 def _event_frames_in_video(
     event_vec: np.ndarray, video: str, resources: dict, per_event_frames: int
-) -> list[int]:
-    """Top CLIP frames for one event, restricted to one video.
+) -> list[dict]:
+    """Top CLIP hits for one event, restricted to one video.
+
+    Returns full hit dicts (keyframe_n lets the VLM locate the JPEG,
+    frame_idx is what goes into the submission).
 
     Implemented as a wide FAISS search + sidecar filter rather than loading
     the video's .npy: same result, and it reuses the shared normalized index
     (k a few thousand is still a sub-10ms flat search).
     """
     hits = clip_search(event_vec, resources, top_k=4000)
-    frames = [h["frame_idx"] for h in hits if h["video"] == video]
-    return frames[:per_event_frames]
+    return [h for h in hits if h["video"] == video][:per_event_frames]
+
+
+def _verified_order(vlm, resources: dict, video: str, event_text: str,
+                    options: list[dict]) -> list[dict]:
+    """Re-order one event's frame options by VLM relevance.
+
+    Stable sort, so equal scores keep CLIP order; frames whose image is
+    missing get the neutral 0.5 and effectively stay at their CLIP rank.
+    """
+    scored = []
+    for hit in options:
+        image = _keyframe_image(resources, video, hit["keyframe_n"])
+        conf = vlm.verify(image, event_text) if image else 0.5
+        scored.append((conf, hit))
+    scored.sort(key=lambda pair: -pair[0])
+    return [hit for _, hit in scored]
 
 
 def _greedy_chronological(frame_options: list[list[int]]) -> list[int] | None:
@@ -250,13 +299,22 @@ def _greedy_chronological(frame_options: list[list[int]]) -> list[int] | None:
 
 
 def run_trake(query: Query, resources: dict, encoder: CLIPTextEncoder,
-              alpha: float = 0.7) -> list[TrakeCandidate]:
+              alpha: float = 0.7, vlm=None) -> list[TrakeCandidate]:
     cfg = resources["cfg"]["retrieval"]
     trake_cfg = cfg.get("trake", {})
+    max_videos = int(cfg.get("rerank", {}).get("trake_videos", 3))
     clip_k = int(trake_cfg.get("per_event_clip_k", 50))
     per_event_frames = int(trake_cfg.get("per_event_frames", 3))
 
     events = split_events(query.text)
+    # The regex only splits on explicit transition markers. When it found
+    # none, let the VLM look for an implicit event sequence — but only
+    # accept a plausible split: a wrong event count invalidates every row.
+    if vlm is not None and len(events) == 1:
+        llm_events = vlm.split_events(query.text)
+        if llm_events and 2 <= len(llm_events) <= 6:
+            events = llm_events
+            print(f"  [{query.query_id}] VLM split into {len(events)} events (regex found 1)")
     event_vecs = encoder.encode_batch(events)
     event_hits = [clip_search(v, resources, top_k=clip_k) for v in event_vecs]
 
@@ -275,25 +333,32 @@ def run_trake(query: Query, resources: dict, encoder: CLIPTextEncoder,
 
     # Try the top-voted videos; usually the first is right and the rest are
     # cheap hedges against a wrong video lock (a wrong video scores 0).
-    for video in voted_videos[:3]:
+    for video in voted_videos[:max_videos]:
         options = [
             _event_frames_in_video(vec, video, resources, per_event_frames)
             for vec in event_vecs
         ]
-        primary = _greedy_chronological(options)
+        if vlm is not None:
+            options = [
+                _verified_order(vlm, resources, video, event, frames)
+                for event, frames in zip(events, options)
+            ]
+        frame_options = [[h["frame_idx"] for h in opts] for opts in options]
+        primary = _greedy_chronological(frame_options)
         if primary is None:
             continue
         _emit(video, primary)
 
-        # Variants: swap the j-th event to its 2nd/3rd best frame while
-        # keeping the assignment monotone. Ordered by minimal deviation so
-        # the best hedges sit right behind the primary row.
+        # Variants: swap the j-th event to its 2nd/3rd best frame. Only
+        # emit when the swapped assignment is STILL chronological —
+        # re-sorting instead would silently permute frames across events.
         for swap_depth in range(1, per_event_frames):
             for j in range(len(events)):
+                if swap_depth >= len(frame_options[j]):
+                    continue
                 variant = list(primary)
-                if swap_depth < len(options[j]):
-                    variant[j] = options[j][swap_depth]
-                    variant.sort()  # re-enforce chronological order
+                variant[j] = frame_options[j][swap_depth]
+                if all(b > a for a, b in zip(variant, variant[1:])):
                     _emit(video, variant)
         if len(candidates) >= 100:
             break

@@ -4,12 +4,14 @@ Loading strategy:
   - Index resources (FAISS + sidecar + BM25) load once, lazily, on the
     first query that needs them.
   - The CLIP text encoder loads on first query.
-  - The VLM (Qwen2-VL, ~16 GB VRAM at fp16) loads ONLY when the first
-    Q&A query arrives, so KIS/TRAKE-only runs never pay for it.
+  - The VLM (Qwen2-VL, ~16 GB VRAM at fp16) also loads lazily — every task
+    uses it now (KIS/TRAKE rerank + Q&A answering), so the first query of
+    ANY type triggers the load. Pass --no-vlm to stay retrieval-only.
 
 Usage:
     python -m aic_system.pipeline --config default --queries data/queries --out data/submission
     python -m aic_system.pipeline --alpha 0.8 --top-k-vqa 30 --vlm-model Qwen/Qwen2-VL-2B-Instruct
+    python -m aic_system.pipeline --no-vlm          # pure CLIP+BM25, skips Q&A queries
 """
 from __future__ import annotations
 
@@ -78,22 +80,37 @@ def _alpha(resources: Resources) -> float:
     return resources.cfg["retrieval"].get("alpha", 0.7)
 
 
+def _vlm(resources: Resources):
+    """The VLM shared by all task runners, or None under --no-vlm."""
+    if getattr(resources.args, "no_vlm", False):
+        return None
+    return resources.vlm
+
+
 def process_query_file(stem: str, queries: list[Query], resources: Resources, out_dir: Path) -> None:
     if not queries:
         return
     task = queries[0].task
+    vlm = _vlm(resources)
 
     all_candidates = []
     for q in queries:
         try:
             if task == "kis":
-                all_candidates.extend(run_kis(q, resources.index, resources.clip, alpha=_alpha(resources)))
-            elif task == "qa":
                 all_candidates.extend(
-                    run_qa(q, resources.index, resources.clip, resources.vlm, alpha=_alpha(resources))
+                    run_kis(q, resources.index, resources.clip, alpha=_alpha(resources), vlm=vlm)
+                )
+            elif task == "qa":
+                if vlm is None:
+                    print(f"  [{q.query_id}] skipped: Q&A requires the VLM (--no-vlm disables it)")
+                    continue
+                all_candidates.extend(
+                    run_qa(q, resources.index, resources.clip, vlm, alpha=_alpha(resources))
                 )
             elif task == "trake":
-                all_candidates.extend(run_trake(q, resources.index, resources.clip, alpha=_alpha(resources)))
+                all_candidates.extend(
+                    run_trake(q, resources.index, resources.clip, alpha=_alpha(resources), vlm=vlm)
+                )
             else:
                 raise ValueError(f"unknown task {task!r}")
         except Exception as e:  # one bad query must not kill the package
@@ -119,6 +136,8 @@ def main():
                     help="how many retrieved frames the VLM answers per Q&A query")
     ap.add_argument("--vlm-model", default=None,
                     help="override models.vqa.name (e.g. Qwen/Qwen2-VL-2B-Instruct)")
+    ap.add_argument("--no-vlm", action="store_true",
+                    help="disable all VLM stages (pure CLIP+BM25; Q&A queries are skipped)")
     args = ap.parse_args()
 
     cfg = load_config(args.config)

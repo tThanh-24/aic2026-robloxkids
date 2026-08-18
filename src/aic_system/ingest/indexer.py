@@ -197,6 +197,26 @@ def matrix_bytes(n: int, dim: int) -> float:
     return n * dim * 4 / 1e6
 
 
+def _resolve_keyframes_dir(base: Path) -> Path:
+    """Descend past wrapper directories left by the organizer zips.
+
+    paths.raw_keyframes is configured as data/raw/keyframes, but the zips
+    extract to keyframes/<video>/NNN.jpg, so the video folders end up one
+    level deeper than the config assumes. A directory is "final" when some
+    subdir holds JPEGs directly; otherwise descend while there is exactly
+    one subdir (covers an empty or not-yet-downloaded dir too).
+    """
+    while base.is_dir():
+        subdirs = [p for p in base.iterdir() if p.is_dir()]
+        if any(next(d.glob("*.jpg"), None) is not None for d in subdirs):
+            return base
+        if len(subdirs) == 1:
+            base = subdirs[0]
+            continue
+        return base
+    return base
+
+
 def load_index_resources(cfg: dict) -> dict:
     """Load every retrieval artifact once. Called a single time at pipeline
     startup; the returned dict is passed to all task runners."""
@@ -226,7 +246,7 @@ def load_index_resources(cfg: dict) -> dict:
         "bm25_videos": bm25_data["videos"],
         "bm25_corpus": bm25_data["corpus"],
         "clip_features_dir": resolve_path(cfg, "clip_features"),
-        "raw_keyframes_dir": resolve_path(cfg, "raw_keyframes"),
+        "raw_keyframes_dir": _resolve_keyframes_dir(resolve_path(cfg, "raw_keyframes")),
         "cfg": cfg,
     }
 

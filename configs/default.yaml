@@ -43,3 +43,7 @@ retrieval:
   trake:
     per_event_clip_k: 50  # keyframe candidates per event for video voting
     per_event_frames: 3   # frames per event used to build candidate rows
+  rerank:
+    # VLM (Qwen) rerank stages, used by every task unless --no-vlm is set.
+    kis_top_k: 40         # KIS frames visually verified per query (head of the list)
+    trake_videos: 5       # voted videos whose per-event frames get verified
