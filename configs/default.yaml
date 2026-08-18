@@ -1,0 +1,51 @@
+# Default configuration. Override with configs/local.yaml (gitignored) or
+# env vars for machine-specific paths.
+
+paths:
+  raw_videos: data/raw/videos
+  raw_keyframes: data/raw/keyframes
+  clip_features: data/features/clip
+  map_keyframes: data/metadata/map_keyframes
+  media_info: data/metadata/media_info
+  objects: data/metadata/objects
+  index_dir: data/index
+  queries_dir: data/queries
+  submission_dir: data/submission
+
+competition:
+  max_candidates_per_query: 100
+  r_at_k: [1, 5, 20, 50, 100]
+  answer_max_chars: 100
+  # Filename patterns the query parser uses to infer task type.
+  task_suffix_map:
+    kis: "kis"
+    qa: "qa"
+    trake: "trake"
+
+models:
+  # Provided by organizer: clip-features-32-aic25-b1 => CLIP ViT-B/32, dim 512.
+  # Set here so downstream code doesn't hardcode it; verify against
+  # inspect_dataset.py output before trusting this.
+  provided_clip:
+    name: "ViT-B/32"
+    dim: 512
+  # Optional stronger embedder you may add on top of the provided features.
+  embedder:
+    name: "google/siglip-so400m-patch14-384"
+    device: "cuda"
+  vqa:
+    name: "Qwen/Qwen2-VL-7B-Instruct"
+    device: "cuda"
+    dtype: "float16"
+  asr:
+    name: "large-v3"
+    device: "cuda"
+    compute_type: "float16"
+  ocr:
+    languages: ["vi", "en"]
+    gpu: false   # kept off GPU on purpose, see README "Dependency strategy"
+
+retrieval:
+  visual_weight: 0.7
+  text_weight: 0.3
+  top_k_for_vqa: 20      # how many KIS candidates get passed into the VQA re-rank

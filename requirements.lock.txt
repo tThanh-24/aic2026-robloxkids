@@ -1,0 +1,17 @@
+# Generated lockfile placeholder.
+#
+# This repo intentionally does NOT ship a pre-generated lockfile, since
+# torch's exact wheel depends on your CUDA/driver setup (see
+# scripts/setup_venv.sh) and locking it here could silently pin the wrong
+# build for your machine.
+#
+# To generate a real lockfile once your venv is set up and working:
+#
+#   source .venv/bin/activate
+#   pip install pip-tools
+#   pip-compile pyproject.toml -o requirements.lock.txt --extra dev
+#
+# Commit the resulting file. From then on, scripts/setup_venv.sh will
+# install from THIS lockfile instead of resolving pyproject.toml fresh,
+# giving you byte-for-byte reproducible installs (important for the
+# Docker build matching your local dev venv exactly).

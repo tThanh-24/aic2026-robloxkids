@@ -1,0 +1,18 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# dataset + generated artifacts -- never commit these
+data/raw/
+data/features/
+data/metadata/
+data/index/
+data/_downloads/
+data/submission/*.csv
+submission.zip
+
+configs/local.yaml
+
+.DS_Store

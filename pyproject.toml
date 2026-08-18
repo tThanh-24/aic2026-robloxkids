@@ -1,0 +1,43 @@
+[project]
+name = "aic-system"
+version = "0.1.0"
+description = "KIS / Q&A / TRAKE retrieval system for the AIC-style video retrieval competition"
+requires-python = ">=3.10,<3.12"
+
+# NOTE on dependency strategy (single venv, avoid CUDA-runtime conflicts):
+#   - torch is pinned to a cu121 build; everything below is chosen to be
+#     compatible with that single CUDA runtime rather than bringing its own
+#     (this is why EasyOCR is used instead of PaddleOCR, and faiss-cpu
+#     instead of faiss-gpu — see README.md "Dependency strategy").
+#   - Install torch FIRST from the official index, then the rest:
+#       pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu121
+#       pip install -r requirements.lock.txt
+#   - Or just run scripts/setup_venv.sh, which does both steps in order.
+dependencies = [
+    "transformers>=4.46,<5.0",
+    "accelerate>=0.34",
+    "sentencepiece",
+    "faster-whisper>=1.0",
+    "easyocr>=1.7",
+    "faiss-cpu>=1.8",
+    "opencv-python-headless>=4.10",
+    "scenedetect>=0.6.4",       # only needed if we ever re-derive shots from raw video
+    "numpy<2.0",                 # faiss-cpu wheels on some platforms lag behind numpy 2.x
+    "pandas>=2.2",
+    "pyarrow>=17.0",
+    "pydantic>=2.8",
+    "pyyaml>=6.0",
+    "tqdm>=4.66",
+    "pillow>=10.4",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pip-tools>=7.4",
+    "ruff>=0.6",
+]
+
+[tool.ruff]
+line-length = 100
