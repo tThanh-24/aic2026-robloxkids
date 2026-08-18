@@ -1,4 +1,4 @@
-# AIC-style Video Retrieval System (KIS / Q&A / TRAKE)
+# AICVideo Retrieval System (KIS / Q&A / TRAKE)
 
 A pipeline for the AIC25-style video retrieval competition: given text
 queries, return up to 100 ranked `(video, frame[, answer])` candidates per
