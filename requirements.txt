@@ -1,0 +1,30 @@
+# requirements.txt — pinned to the working venv (torch 2.6.0+cu124).
+#
+# Install order matters — torch must come FIRST from the PyTorch index so the
+# CUDA build is cu124, not the default PyPI one:
+#
+#   pip install torch==2.6.0 torchaudio==2.6.0 torchvision==0.21.0 \
+#     --index-url https://download.pytorch.org/whl/cu124
+#   pip install -r requirements.txt
+#
+# The torch line below is kept for "pip install -r requirements.txt" alone
+# (e.g. CPU-only / non-GPU boxes) but on a GPU machine always use the
+# two-step install above.
+#
+# Dev tools are in pyproject.toml [project.optional-dependencies]: pip install -e ".[dev]"
+
+torch==2.6.0
+transformers==4.57.6
+accelerate==1.14.0
+sentencepiece==0.2.2
+faiss-cpu==1.15.0
+opencv-python-headless==4.11.0.86
+rank-bm25==0.2.2
+numpy==1.26.4
+pandas==2.3.3
+pyarrow==25.0.1
+pydantic==2.13.4
+pyyaml==6.0.3
+tqdm==4.70.0
+pillow==12.3.0
+python-dotenv==1.2.3

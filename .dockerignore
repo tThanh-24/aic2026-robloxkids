@@ -1,0 +1,15 @@
+# Everything not needed inside the image. data/ especially: the dataset
+# is mounted at runtime, never baked in (it's ~100 GB).
+venv/
+.venv/
+data/
+.git/
+.gitignore
+**/__pycache__/
+*.egg-info/
+*.pyc
+tests/
+*.zip
+.pytest_cache/
+.ruff_cache/
+configs/local.yaml
