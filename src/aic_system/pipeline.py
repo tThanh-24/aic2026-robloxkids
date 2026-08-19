@@ -45,6 +45,8 @@ class Resources:
                 self.cfg["retrieval"]["top_k_for_vqa"] = self.args.top_k_vqa
             if self.args.vlm_model:
                 self.cfg["models"]["vqa"]["name"] = self.args.vlm_model
+            if getattr(self.args, "rerank", None) is not None:
+                self.cfg["retrieval"].setdefault("rerank", {})["enabled"] = self.args.rerank
         return self._index
 
     @property
@@ -78,6 +80,13 @@ def _alpha(resources: Resources) -> float:
     return resources.cfg["retrieval"].get("alpha", 0.7)
 
 
+def _maybe_vlm(resources: Resources):
+    """The VLM for KIS/TRAKE re-ranking — None unless rerank is enabled, so
+    retrieval-only runs never load the ~16 GB model (Q&A always needs it)."""
+    rr = resources.cfg["retrieval"].get("rerank", {})
+    return resources.vlm if rr.get("enabled", False) else None
+
+
 def process_query_file(stem: str, queries: list[Query], resources: Resources, out_dir: Path) -> None:
     if not queries:
         return
@@ -87,13 +96,15 @@ def process_query_file(stem: str, queries: list[Query], resources: Resources, ou
     for q in queries:
         try:
             if task == "kis":
-                all_candidates.extend(run_kis(q, resources.index, resources.clip, alpha=_alpha(resources)))
+                all_candidates.extend(run_kis(q, resources.index, resources.clip,
+                                              alpha=_alpha(resources), vlm=_maybe_vlm(resources)))
             elif task == "qa":
                 all_candidates.extend(
                     run_qa(q, resources.index, resources.clip, resources.vlm, alpha=_alpha(resources))
                 )
             elif task == "trake":
-                all_candidates.extend(run_trake(q, resources.index, resources.clip, alpha=_alpha(resources)))
+                all_candidates.extend(run_trake(q, resources.index, resources.clip,
+                                                alpha=_alpha(resources), vlm=_maybe_vlm(resources)))
             else:
                 raise ValueError(f"unknown task {task!r}")
         except Exception as e:  # one bad query must not kill the package
@@ -119,6 +130,11 @@ def main():
                     help="how many retrieved frames the VLM answers per Q&A query")
     ap.add_argument("--vlm-model", default=None,
                     help="override models.vqa.name (e.g. Qwen/Qwen2-VL-2B-Instruct)")
+    ap.add_argument("--rerank", dest="rerank", action="store_true", default=None,
+                    help="force-enable Qwen2-VL re-ranking for KIS/TRAKE "
+                         "(overrides configs)")
+    ap.add_argument("--no-rerank", dest="rerank", action="store_false",
+                    help="disable Qwen2-VL re-ranking (KIS/TRAKE never load the VLM)")
     args = ap.parse_args()
 
     cfg = load_config(args.config)

@@ -20,6 +20,9 @@ Scoring-driven design choices (see doc.md):
     the interval carries a semantically-correct answer.
   - TRAKE rows must have EXACTLY N frames in chronological order; a row
     with the wrong count risks failing the evaluator's parser entirely.
+  - Qwen2-VL re-rank (retrieval.rerank.enabled): KIS moves verified top-N
+    hits to the front and TRAKE prefers verified per-event frames; rows are
+    only ever REORDERED, so recall@k is never reduced by the VLM.
 """
 from __future__ import annotations
 
@@ -122,11 +125,38 @@ def _retrieve(query_text: str, resources: dict, encoder: CLIPTextEncoder,
 # KIS
 # ---------------------------------------------------------------------------
 def run_kis(query: Query, resources: dict, encoder: CLIPTextEncoder,
-            alpha: float = 0.7) -> list[KISCandidate]:
+            alpha: float = 0.7, vlm=None) -> list[KISCandidate]:
     cfg = resources["cfg"]["retrieval"]
     ranked = _retrieve(query.text, resources, encoder, alpha,
                        top_k_clip=cfg.get("top_k_clip", 200), top_k=100)
+    if vlm is not None:
+        ranked = rerank_with_vlm(ranked, query.text, resources, vlm, cfg)
     return [KISCandidate(video=h["video"], frame=h["frame_idx"]) for h in ranked]
+
+
+def rerank_with_vlm(ranked: list[dict], query_text: str, resources: dict,
+                    vlm, cfg: dict) -> list[dict]:
+    """Qwen2-VL verification of the top rerank.top_n hits.
+
+    Verified hits move to the front (ordered by fused score + VLM
+    confidence); everything else keeps its retrieval order, so recall
+    beyond the verified window is unchanged.
+    """
+    rr = cfg.get("rerank", {})
+    top_n = int(rr.get("top_n", 20))
+    lang = detect_language(query_text)
+    head, tail = ranked[:top_n], ranked[top_n:]
+    max_fused = max((h["fused"] for h in head), default=1.0) or 1.0
+    for h in head:
+        image = _keyframe_image(resources, h["video"], h["keyframe_n"])
+        if image is None:
+            h["verified"], h["vconf"] = False, 0.0
+            continue
+        h["verified"], h["vconf"] = vlm.verify(image, query_text, lang=lang)
+    head.sort(key=lambda h: (h.get("verified", False),
+                             0.5 * (h["fused"] / max_fused) + 0.5 * h.get("vconf", 0.0)),
+              reverse=True)
+    return head + tail
 
 
 # ---------------------------------------------------------------------------
@@ -155,15 +185,25 @@ def run_qa(query: Query, resources: dict, encoder: CLIPTextEncoder, vlm,
     ranked = _retrieve(query.text, resources, encoder, alpha,
                        top_k_clip=cfg.get("top_k_clip", 200), top_k=top_k_vqa)
 
-    answered: list[dict] = []
+    # One VLM call per DISTINCT VIDEO (up to 3 of its keyframes in a single
+    # multi-image prompt): fewer calls than per-frame answering, and counting
+    # or order questions get temporal context. Each row then carries the
+    # answer generated from its own video instead of one global answer.
+    by_video: dict[str, list[dict]] = {}
     for hit in ranked:
-        image = _keyframe_image(resources, hit["video"], hit["keyframe_n"])
-        if image is None:
-            continue  # no keyframes downloaded -> QA answering impossible
-        answer, conf = vlm.answer_question(image, query.text, lang=lang)
-        answered.append({**hit, "answer": answer.strip()[:100], "conf": conf})
+        by_video.setdefault(hit["video"], []).append(hit)
 
-    if not answered:
+    video_answer: dict[str, tuple[str, float]] = {}
+    for video, hits in by_video.items():
+        images = [img for img in (_keyframe_image(resources, video, h["keyframe_n"])
+                                  for h in hits[:3]) if img is not None]
+        if not images:
+            video_answer[video] = ("", 0.0)
+            continue
+        answer, conf = vlm.answer_question(images, query.text, lang=lang)
+        video_answer[video] = (answer.strip()[:100], conf)
+
+    if not any(a for a, _ in video_answer.values()):
         # Still emit retrieval-ranked rows with empty answers: frame hits can
         # earn partial credit, and a missing CSV forfeits the query entirely.
         print(f"  [{query.query_id}] no keyframe images found for VLM; "
@@ -174,17 +214,18 @@ def run_qa(query: Query, resources: dict, encoder: CLIPTextEncoder, vlm,
                                top_k_clip=cfg.get("top_k_clip", 200), top_k=100)
         ]
 
-    # Rank answered candidates by retrieval score + VLM confidence, then
-    # keep extending the list with the remaining retrieval filler rows.
-    max_fused = max(h["fused"] for h in answered) or 1.0
-    answered.sort(
-        key=lambda h: 0.5 * (h["fused"] / max_fused) + 0.5 * h["conf"], reverse=True
-    )
-    primary_answer = answered[0]["answer"]
+    # Rank rows by retrieval score + their video's answer confidence.
+    max_fused = max(h["fused"] for h in ranked) or 1.0
+    ranked.sort(key=lambda h: 0.5 * (h["fused"] / max_fused)
+                + 0.5 * video_answer[h["video"]][1], reverse=True)
+    best_answer = video_answer[ranked[0]["video"]][0]
 
-    candidates = [QACandidate(video=h["video"], frame=h["frame_idx"], answer=h["answer"])
-                  for h in answered]
+    candidates = [QACandidate(video=h["video"], frame=h["frame_idx"],
+                              answer=video_answer[h["video"]][0]) for h in ranked]
 
+    # Filler rows up to 100: propagate the answer of the row's own video when
+    # we have one (answer correctness is only scored inside the GT segment,
+    # which lives in one video), else the globally best answer.
     seen = {(c.video, c.frame) for c in candidates}
     for hit in _retrieve(query.text, resources, encoder, alpha,
                          top_k_clip=cfg.get("top_k_clip", 200), top_k=100):
@@ -192,8 +233,9 @@ def run_qa(query: Query, resources: dict, encoder: CLIPTextEncoder, vlm,
             break
         if (hit["video"], hit["frame_idx"]) in seen:
             continue
+        answer = video_answer.get(hit["video"], ("", 0.0))[0] or best_answer
         candidates.append(
-            QACandidate(video=hit["video"], frame=hit["frame_idx"], answer=primary_answer)
+            QACandidate(video=hit["video"], frame=hit["frame_idx"], answer=answer)
         )
     return candidates
 
@@ -256,12 +298,41 @@ def _greedy_chronological(frame_options: list[list[int]]) -> list[int] | None:
     return chosen
 
 
+def _video_frame_map(resources: dict, video: str) -> dict[int, int]:
+    """frame_idx -> keyframe_n for one video (locates the JPEG in TRAKE)."""
+    side = resources["sidecar"]
+    vid = resources["video_to_id"].get(video)
+    if vid is None:
+        return {}
+    mask = side["video_ids"] == vid
+    return {int(f): int(k)
+            for f, k in zip(side["frame_idx"][mask], side["keyframe_n"][mask])}
+
+
+def _verify_order(frames: list[int], event_text: str, video: str,
+                  frame_map: dict[int, int], resources: dict, vlm,
+                  lang: str) -> list[int]:
+    """Reorder one event's candidate frames: Qwen-verified matches first
+    (by confidence), unverified/unverifiable keep their original order."""
+    scored = []
+    for f in frames:
+        kf = frame_map.get(f)
+        image = _keyframe_image(resources, video, kf) if kf else None
+        ok, conf = vlm.verify(image, event_text, lang=lang) if image else (False, 0.0)
+        scored.append((ok, conf, f))
+    verified = sorted((s for s in scored if s[0]), key=lambda s: s[1], reverse=True)
+    rest = [s for s in scored if not s[0]]
+    return [s[2] for s in verified + rest]
+
+
 def run_trake(query: Query, resources: dict, encoder: CLIPTextEncoder,
-              alpha: float = 0.7) -> list[TrakeCandidate]:
+              alpha: float = 0.7, vlm=None) -> list[TrakeCandidate]:
     cfg = resources["cfg"]["retrieval"]
     trake_cfg = cfg.get("trake", {})
     clip_k = int(trake_cfg.get("per_event_clip_k", 50))
     per_event_frames = int(trake_cfg.get("per_event_frames", 3))
+    verify_on = vlm is not None and cfg.get("rerank", {}).get("enabled", False)
+    lang = detect_language(query.text)
 
     events = split_events(query.text)
     event_vecs = encoder.encode_batch(events)
@@ -283,10 +354,14 @@ def run_trake(query: Query, resources: dict, encoder: CLIPTextEncoder,
     # Try the top-voted videos; usually the first is right and the rest are
     # cheap hedges against a wrong video lock (a wrong video scores 0).
     for video in voted_videos[:3]:
-        options = [
-            _event_frames_in_video(vec, video, resources, per_event_frames)
-            for vec in event_vecs
-        ]
+        frame_map = _video_frame_map(resources, video) if verify_on else {}
+        options = []
+        for vec, text in zip(event_vecs, events):
+            frames = _event_frames_in_video(vec, video, resources, per_event_frames)
+            if verify_on:
+                frames = _verify_order(frames, text, video, frame_map,
+                                       resources, vlm, lang)
+            options.append(frames)
         primary = _greedy_chronological(options)
         if primary is None:
             continue

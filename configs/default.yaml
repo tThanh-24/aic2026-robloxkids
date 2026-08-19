@@ -40,6 +40,11 @@ retrieval:
   alpha: 0.7              # visual (CLIP) weight; 1-alpha goes to BM25
   top_k_clip: 200         # FAISS candidates fetched per query before fusion
   top_k_for_vqa: 20       # KIS candidates passed to the VLM for answering
+  rerank:
+    enabled: true         # Qwen2-VL verifies top candidates: KIS re-rank of
+                          # the top_n hits, TRAKE per-event frame validation.
+                          # Set false (or --no-rerank) for VLM-free fast runs.
+    top_n: 20             # KIS candidates verified per query
   trake:
     per_event_clip_k: 50  # keyframe candidates per event for video voting
     per_event_frames: 3   # frames per event used to build candidate rows
