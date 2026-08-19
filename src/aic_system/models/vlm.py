@@ -101,7 +101,7 @@ class VLM:
         probs = self.torch.softmax(
             self.torch.stack(out.scores, dim=1).float(), dim=-1
         )  # (1, T, V)
-        gen_probs = probs[0, torch.arange(len(token_ids), device=probs.device), token_ids.to(probs.device)]
+        gen_probs = probs[0, self.torch.arange(len(token_ids), device=probs.device), token_ids.to(probs.device)]
         confidence = float(self.torch.exp(self.torch.log(gen_probs.clamp_min(1e-9)).mean()))
 
         logging.getLogger(__name__).debug("vlm answer=%r conf=%.3f", answer, confidence)

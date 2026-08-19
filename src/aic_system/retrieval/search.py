@@ -146,9 +146,10 @@ def _keyframe_image(resources: dict, video: str, keyframe_n: int) -> Path | None
 
 
 def run_qa(query: Query, resources: dict, encoder: CLIPTextEncoder, vlm,
-           alpha: float = 0.7, top_k_vqa: int = 20) -> list[QACandidate]:
+           alpha: float = 0.7, top_k_vqa: int | None = None) -> list[QACandidate]:
     cfg = resources["cfg"]["retrieval"]
-    top_k_vqa = top_k_vqa or cfg.get("top_k_for_vqa", 20)
+    if top_k_vqa is None:
+        top_k_vqa = int(cfg.get("top_k_for_vqa", 20))
     lang = detect_language(query.text)
 
     ranked = _retrieve(query.text, resources, encoder, alpha,
@@ -163,9 +164,15 @@ def run_qa(query: Query, resources: dict, encoder: CLIPTextEncoder, vlm,
         answered.append({**hit, "answer": answer.strip()[:100], "conf": conf})
 
     if not answered:
+        # Still emit retrieval-ranked rows with empty answers: frame hits can
+        # earn partial credit, and a missing CSV forfeits the query entirely.
         print(f"  [{query.query_id}] no keyframe images found for VLM; "
-              f"answering disabled (check paths.raw_keyframes)")
-        return []
+              f"emitting retrieval-only rows (check paths.raw_keyframes)")
+        return [
+            QACandidate(video=h["video"], frame=h["frame_idx"], answer="")
+            for h in _retrieve(query.text, resources, encoder, alpha,
+                               top_k_clip=cfg.get("top_k_clip", 200), top_k=100)
+        ]
 
     # Rank answered candidates by retrieval score + VLM confidence, then
     # keep extending the list with the remaining retrieval filler rows.

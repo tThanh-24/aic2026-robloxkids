@@ -197,6 +197,22 @@ def matrix_bytes(n: int, dim: int) -> float:
     return n * dim * 4 / 1e6
 
 
+def resolve_keyframes_root(root: Path, video_names: list[str]) -> Path:
+    """Find the directory that actually holds the {video_name}/ JPEG folders.
+
+    Organizer keyframe zips often nest one extra level (e.g.
+    data/raw/keyframes/keyframes/L21_V001/...). Probing with real video
+    names from the index makes the lookup immune to that packaging.
+    """
+    probes = video_names[:5] or []
+    if any((root / v).is_dir() for v in probes):
+        return root
+    for sub in sorted(p for p in root.iterdir() if p.is_dir()) if root.is_dir() else []:
+        if any((sub / v).is_dir() for v in probes):
+            return sub
+    return root
+
+
 def load_index_resources(cfg: dict) -> dict:
     """Load every retrieval artifact once. Called a single time at pipeline
     startup; the returned dict is passed to all task runners."""
@@ -217,6 +233,12 @@ def load_index_resources(cfg: dict) -> dict:
     with open(index_dir / "bm25.pkl", "rb") as f:
         bm25_data = pickle.load(f)
 
+    raw_kf_root = resolve_path(cfg, "raw_keyframes")
+    resolved_kf_root = resolve_keyframes_root(raw_kf_root, video_names)
+    if resolved_kf_root != raw_kf_root:
+        print(f"  [keyframes] video folders not directly under {raw_kf_root}; "
+              f"using {resolved_kf_root}")
+
     return {
         "faiss": index,
         "sidecar": sidecar,
@@ -226,7 +248,7 @@ def load_index_resources(cfg: dict) -> dict:
         "bm25_videos": bm25_data["videos"],
         "bm25_corpus": bm25_data["corpus"],
         "clip_features_dir": resolve_path(cfg, "clip_features"),
-        "raw_keyframes_dir": resolve_path(cfg, "raw_keyframes"),
+        "raw_keyframes_dir": resolved_kf_root,
         "cfg": cfg,
     }
 
